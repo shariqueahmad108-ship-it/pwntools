@@ -11,6 +11,8 @@
 
 import os
 import doctest
+import importlib
+import inspect
 import signal
 import subprocess
 import sys
@@ -459,6 +461,71 @@ class PlatformDocTestBuilder(sphinx.ext.doctest.DocTestBuilder):
         # Only called when there are tests to run in the current document.
         self._doctree_had_tests = True
         return super(PlatformDocTestBuilder, self).test_group(group)
+
+    # Sphinx reports "line ?" for doctests in docstrings, and names the documented
+    # module instead of the file an inherited docstring lives in. Find the block in
+    # the source of the documented object instead.
+    def get_filename_for_node(self, node, docname):
+        location = locate_docstring_doctest(node)
+        if location:
+            return os.path.relpath(location[0], self.env.srcdir)
+        return super(PlatformDocTestBuilder, self).get_filename_for_node(node, docname)
+
+    @staticmethod
+    def get_line_number(node):
+        location = locate_docstring_doctest(node)
+        if location:
+            return location[1]
+        return sphinx.ext.doctest.DocTestBuilder.get_line_number(node)
+
+def resolve_documented_object(fullname):
+    parts = fullname.split('.')
+    for i in range(len(parts), 0, -1):
+        try:
+            obj = importlib.import_module('.'.join(parts[:i]))
+        except ImportError:
+            continue
+        parent = None
+        try:
+            for attr in parts[i:]:
+                parent, obj = obj, getattr(obj, attr)
+        except AttributeError:
+            return None
+        # autodoc falls back to the docstring of the overridden member, so do we
+        if not getattr(obj, '__doc__', None) and inspect.isclass(parent):
+            for base in parent.__mro__[1:]:
+                inherited = base.__dict__.get(parts[-1])
+                if getattr(inherited, '__doc__', None):
+                    return inherited
+        return obj
+    return None
+
+def locate_docstring_doctest(node):
+    """Return (source file, 0-based line of the block's first line) for a
+    doctest block inside a docstring, or None if the block can't be found."""
+    source = node.source or ''
+    if ':docstring of ' not in source:
+        return None
+    obj = resolve_documented_object(source.rsplit(':docstring of ', 1)[1])
+    if isinstance(obj, property):
+        obj = obj.fget
+    try:
+        obj = inspect.unwrap(obj)
+        filename = inspect.getsourcefile(obj)
+        lines, start = inspect.getsourcelines(obj)
+    except (TypeError, OSError, ValueError):
+        return None
+    text = node['test'] if 'test' in node else node.astext()
+    first = next((line.strip() for line in text.splitlines() if line.strip()), None)
+    if not filename or not first:
+        return None
+    start = max(start - 1, 0)
+    matches = [start + i for i, line in enumerate(lines) if line.strip() == first]
+    if not matches:
+        return None
+    # node.line is relative to the docstring, use it to pick between repeated lines
+    estimate = start + (node.line or 0)
+    return filename, min(matches, key=lambda lineno: abs(lineno - estimate))
 
 if 'doctest' in sys.argv:
     def setup(app):
